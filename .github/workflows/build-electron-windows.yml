@@ -1,0 +1,126 @@
+name: Build Electron (Shiny + R) - Windows
+
+on:
+  push:
+    branches: [ feature/package ]
+  pull_request:
+
+env:
+  R_VERSION: 4.4.2
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: electron/package-lock.json
+
+      - name: Install electron deps
+        working-directory: electron
+        run: npm ci
+
+      # ----------------- Fetch portable R (Windows only) -----------------
+      - name: Fetch R (Windows)
+        shell: pwsh
+        working-directory: electron/scripts
+        run: |
+          ./get_r_windows.ps1
+          New-Item -ItemType Directory -Force ../runtime/win | Out-Null
+          Copy-Item -Recurse -Force r-win/R ../runtime/win/R
+
+      - name: Verify R runtime exists
+        shell: pwsh
+        working-directory: electron
+        run: |
+          $r = Get-ChildItem -Recurse -Path runtime\win -Filter Rscript.exe -File | Select-Object -First 1
+          if (-not $r) { throw "Rscript.exe not found under electron/runtime/win" }
+          Write-Host "Found Rscript at: $($r.FullName)"
+
+      # ----------------- Preinstall R packages into bundled library -----------------
+      - name: Install R packages (Windows)
+        working-directory: electron/scripts
+        shell: pwsh
+        run: |
+          $root = Resolve-Path "../runtime/R"
+          $rscript = Get-ChildItem -Recurse -Path $root -Filter Rscript.exe -File | Select-Object -First 1
+          if (-not $rscript) { throw "Rscript.exe not found anywhere under $root" }
+          $LIB = Join-Path $root "library"
+          New-Item -ItemType Directory -Force -Path $LIB | Out-Null
+          & $rscript.FullName "setup-r-lib.R" $root $LIB
+
+      # (ZIP STEP REMOVED) — runtime stays as a plain folder for packaging
+
+      - name: Verify repo contents
+        working-directory: electron
+        shell: pwsh
+        run: |
+          Write-Host "PWD:" (Get-Location)
+          Write-Host "List electron/:"
+          Get-ChildItem -Force .
+          Write-Host "List electron/runtime/:"
+          if (Test-Path "runtime") { Get-ChildItem -Force -Recurse "runtime" | Select-Object -First 20 }
+          else { Write-Host "electron/runtime not found" }
+          Write-Host "List electron/data/:"
+          if (Test-Path "data") { Get-ChildItem -Force -Recurse "data" | Select-Object -First 20 }
+          else { Write-Host "electron/data not found" }
+
+      # ----------------- Stage app data into resources/data -----------------
+      - name: Stage app data (Windows)
+        working-directory: electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $src1 = Join-Path (Get-Location) 'resources\data'
+          $src2 = Join-Path (Get-Location) 'data'
+          $src  = if (Test-Path -LiteralPath $src1) { $src1 }
+                  elseif (Test-Path -LiteralPath $src2) { $src2 }
+                  else { $null }
+
+          if (-not $src) { Write-Error "No data folder found at '$src1' or '$src2'"; exit 1 }
+
+          $dst = Join-Path (Get-Location) 'resources\data'
+          Write-Host "Source: $src"
+          Write-Host "Dest  : $dst"
+
+          if (Test-Path -LiteralPath $dst) { Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Force $dst | Out-Null
+
+          robocopy $src $dst /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+          $code = $LASTEXITCODE
+          Write-Host "ROBOCOPY exit code: $code"
+          if ($code -gt 3) { exit $code }       # >3 is failure in robocopy semantics
+
+          # Sanity check (adjust to a file you expect):
+          $orgInfo = Join-Path $dst 'data113\demo\orgInfo.db'
+          if (-not (Test-Path -LiteralPath $orgInfo)) {
+            Write-Error "Expected file not found after copy: $orgInfo"
+            exit 1
+          }
+
+          Write-Host "Staged data OK. Sample:"
+          Get-ChildItem -Force (Split-Path $orgInfo) | Select-Object Name,Length | Format-Table -AutoSize
+
+          # Normalize step result to success for 0..3
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      # ----------------- Build Electron installer -----------------
+      - name: Build
+        working-directory: electron
+        run: npm run dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shinygo-windows
+          path: electron/dist/**
+          if-no-files-found: ignore

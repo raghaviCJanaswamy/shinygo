@@ -1,20 +1,75 @@
 {
   "name": "shinygo-desktop",
   "version": "1.0.0",
-  "description": "Electron wrapper for the Shiny app",
-  "main": "main.js",
+  "productName": "ShinyGODesktop",
+  "description": "Electron wrapper for the ShinyGO app",
   "author": "You",
   "license": "MIT",
+  "main": "main.js",
+  "type": "commonjs",
   "scripts": {
+    "start": "electron .",
     "dev": "electron .",
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },
+  "dependencies": {
+    "extract-zip": "^2.0.1",
+    "fs-extra": "^11.2.0",
+    "tar": "^6.2.1",
+    "undici": "^6.19.8"
+  },
   "devDependencies": {
-    "electron": "^31.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "31.7.7",
+    "electron-builder": "24.13.3"
   },
   "build": {
-    "extends": "electron-builder.yml"
+    "appId": "com.shinygo",
+    "productName": "ShinyGODesktop",
+    "directories": {
+      "buildResources": "build"  
+    },
+    "files": [      
+      "main.js",
+      "start-shiny.R",
+      "package.json",
+      "node_modules/**",          
+      "!scripts/**",
+      "!resources/data/**"
+    ],
+    "asar": false,
+    "asarUnpack": [
+      "runtime/**",
+      "data/**",
+      "app/**"
+    ],
+    "extraResources": [
+      { "from": "resources/data", "to": "data" },
+      { "from": "runtime/win", "to": "runtime/win" },
+      { "from": "../app", "to": "app" }
+    ],
+    "mac": {
+      "category": "public.app-category.education",
+      "target": ["dmg", "zip"],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
+      "entitlements": "entitlements.mac.plist",
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "artifactName": "${productName}-${version}-win-${arch}.${ext}"
+    },
+    "linux": {
+      "category": "Education",
+      "target": ["AppImage", "deb"],
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false
+    }
   }
 }

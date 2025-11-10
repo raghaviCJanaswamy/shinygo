@@ -21,52 +21,141 @@ library(DT, verbose = FALSE) # for renderDataTable
 
 
 # define where database is located
+# define where database is located
 db_ver <<- "data113"
 db_url <<- "http://bioinformatics.sdstate.edu/data/"
 
-# if environmental variable is not set, use relative path
-datapath <<- Sys.getenv("IDEP_DATABASE")[1]
-# if not defined in the environment, use too levels above
-if (nchar(datapath) == 0) {
-  datapath <<- paste0("../../data/")
-}
-# Add version
-datapath <<- paste0(datapath, "/", db_ver, "/")
-org_info_file <<- paste0(datapath, "demo/orgInfo.db")
-if (!file.exists(org_info_file)) {
-  datapath <<- paste0("./", db_ver, "/")
-  org_info_file <<- paste0(datapath, "demo/orgInfo.db")
-}
+# Raw env var; may be parent dir OR the version dir itself
+raw_db <- Sys.getenv("IDEP_DATABASE", "")
 
-connect_convert_db <- function(datapath = datapath) {
-  if (!file.exists(org_info_file)) {
-    # download org_info and demo files to current folder
-    withProgress(message = "Download demo data and species database", {
-      incProgress(0.2)
-      file_name <- paste0(db_ver, ".tar.gz")
-      options(timeout = 300)
-      download.file(
-        url = paste0(db_url, db_ver, "/", file_name),
-        destfile = file_name,
-        mode = "wb",
-        quiet = FALSE
-      )
-      untar(file_name) # untar and unzip the files
-      file.remove(file_name) # delete the tar file to save storage
-    })
+resolve_datapath <- function(raw, db_ver) {
+  # 0) If IDEP_DATABASE is provided, honor it first
+  if (nzchar(raw)) {
+    raw_norm <- normalizePath(raw, winslash = "/", mustWork = FALSE)
+
+    # Case A: IDEP_DATABASE already points to .../data113
+    pat <- paste0("/", db_ver, "/?$")
+    if (grepl(pat, raw_norm)) {
+      if (!grepl("/$", raw_norm)) raw_norm <- paste0(raw_norm, "/")
+      return(raw_norm)
+    }
+
+    # Case B: IDEP_DATABASE is the parent that contains data113/
+    return(normalizePath(file.path(raw_norm, db_ver), winslash = "/", mustWork = FALSE))
   }
 
-  return(DBI::dbConnect(
-    drv = RSQLite::dbDriver("SQLite"),
-    dbname = org_info_file,
-    flags = RSQLite::SQLITE_RO
-  ))
+  # 1) Local dev folder next to the app (keeps old behavior)
+  if (dir.exists("data113")) {
+    return(normalizePath("data113", winslash = "/", mustWork = FALSE))
+  }
+
+  # 2) **Packaged Electron**: resources/app  -> prefer sibling  resources/data/<db_ver>
+  #    When Electron runs a packaged app, our CWD is <resources>/app.
+  #    The data folder should be <resources>/data (sibling of app).
+  res_sibling_parent <- normalizePath(file.path(".."), winslash = "/", mustWork = FALSE) # <resources>
+  res_data_ver       <- file.path(res_sibling_parent, "data", db_ver)
+  if (dir.exists(res_data_ver)) {
+    return(normalizePath(res_data_ver, winslash = "/", mustWork = FALSE))
+  }
+
+  # 3) Legacy fallback used in your original code (../../data/<db_ver>)
+  parent <- "../../data"
+  return(normalizePath(file.path(parent, db_ver), winslash = "/", mustWork = FALSE))
 }
 
+datapath <<- resolve_datapath(raw_db, db_ver)
+org_info_file <<- file.path(datapath, "demo", "orgInfo.db")
+
+cat("---- ShinyGO DB path debug ----\n")
+cat("IDEP_DATABASE raw:", raw_db, "\n")
+cat("Using datapath   :", datapath, "\n")
+cat("orgInfo file     :", org_info_file, "\n")
+cat("orgInfo exists?  :", file.exists(org_info_file), "\n")
+cat("-------------------------------\n")
 
 
+connect_convert_db <- function(datapath_arg = NULL) {
+  # Decide which datapath to use
+  if (is.null(datapath_arg)) {
+    if (exists("datapath", envir = .GlobalEnv)) {
+      dp <- get("datapath", envir = .GlobalEnv)
+    } else {
+      stop("No datapath_arg provided and global 'datapath' not found.")
+    }
+  } else {
+    dp <- datapath_arg
+  }
 
+  dp <- normalizePath(dp, winslash = "/", mustWork = FALSE)
+  org_file_local <- file.path(dp, "demo", "orgInfo.db")
 
+  # Helper: download & extract DB without Shiny progress
+  download_db_plain <- function() {
+    message("Downloading ShinyGO DB into: ", dp)
+    dir.create(dp, recursive = TRUE, showWarnings = FALSE)
+
+    file_name <- file.path(dp, paste0(db_ver, ".tar.gz"))
+    options(timeout = 300)
+
+    download.file(
+      url      = paste0(db_url, db_ver, "/", db_ver, ".tar.gz"),
+      destfile = file_name,
+      mode     = "wb",
+      quiet    = FALSE
+    )
+
+    parent_dir <- dirname(dp)  # expect <parent>/data113/...
+    untar(file_name, exdir = parent_dir)
+    file.remove(file_name)
+
+    # Refresh org_info path after untar
+    org_file_local <<- file.path(dp, "demo", "orgInfo.db")
+  }
+
+  # If DB not there yet, download it
+  if (!file.exists(org_file_local)) {
+    in_shiny <- FALSE
+    if (requireNamespace("shiny", quietly = TRUE)) {
+      # only treat as Shiny if the reactive domain is a ShinySession
+      dom <- shiny::getDefaultReactiveDomain()
+      in_shiny <- !is.null(dom) && inherits(dom, "ShinySession")
+    }
+
+    if (in_shiny) {
+      shiny::withProgress(message = "Download demo data and species database", {
+        shiny::incProgress(0.2)
+        download_db_plain()
+      })
+    } else {
+      download_db_plain()
+    }
+  }
+
+  if (!file.exists(org_file_local)) {
+    stop("orgInfo.db not found at: ", org_file_local,
+         "\nCheck IDEP_DATABASE / datapath configuration and data113 layout.")
+  }
+
+  conn <- try(
+    DBI::dbConnect(
+      drv    = RSQLite::dbDriver("SQLite"),
+      dbname = org_file_local,
+      flags  = RSQLite::SQLITE_RO
+    ),
+    silent = TRUE
+  )
+
+  if (inherits(conn, "try-error")) {
+    stop("Could not connect to database at: ", org_file_local,
+         "\nUnderlying error:\n", as.character(conn))
+  }
+
+  # Keep globals consistent
+  datapath <<- dp
+  org_info_file <<- org_file_local
+
+  conn
+}
 
 
 STRING_DB_VERSION <- "12.0" # what version of STRINGdb needs to be used
@@ -350,15 +439,64 @@ columnSelection <- list(
 #' @return Database connection.
 connect_convert_db_org <- function(datapath = datapath, select_org) {
   ix <- which(orgInfo$id == select_org)
+  if (!length(ix)) stop("species ID not found in orgInfo: ", select_org)
+
   db_file <- orgInfo[ix, "file"]
-  return(try(
-    DBI::dbConnect(
-      drv = RSQLite::dbDriver("SQLite"),
-      dbname = paste0(datapath, "db/", db_file),
-      flags = RSQLite::SQLITE_RO
+  db_dir  <- file.path(datapath, "db")
+  db_path <- file.path(db_dir, db_file)
+
+  message("connect_convert_db_org: datapath = ", datapath)
+  message("connect_convert_db_org: db_file  = ", db_file)
+  message("connect_convert_db_org: db_path  = ", db_path)
+
+  # If the exact path exists, use it.
+  if (file.exists(db_path)) {
+    return(DBI::dbConnect(RSQLite::SQLite(), dbname = db_path, flags = RSQLite::SQLITE_RO))
+  }
+
+  # Fallbacks: normalize & search
+  if (!dir.exists(db_dir)) {
+    stop("DB folder not found: ", db_dir)
+  }
+
+  cand <- list.files(db_dir, pattern = "[.]db$", full.names = FALSE)
+  if (!length(cand)) {
+    stop("No .db files found in: ", db_dir)
+  }
+
+  strip_ext <- function(x) sub("[.]db$", "", x, ignore.case = TRUE)
+  # normalize: lowercase, remove all non-alphanumerics (so _, -, spaces all disappear)
+  norm <- function(x) gsub("[^a-z0-9]+", "", tolower(x))
+
+  wanted <- norm(strip_ext(db_file))
+  norm_cand <- norm(strip_ext(cand))
+
+  # 1) exact normalized match
+  hit <- cand[norm_cand == wanted]
+
+  # 2) if still nothing, fuzzy match (closest by agrep)
+  if (!length(hit)) {
+    idx <- agrep(wanted, norm_cand, max.distance = 0.1, value = FALSE)
+    if (length(idx)) hit <- cand[idx[1]]
+  }
+
+  if (!length(hit)) {
+    message("connect_convert_db_org: candidates in ", db_dir, ":")
+    message(paste0("  - ", cand, collapse = "\n"))
+    stop(
+      "Species DB not found at: ", db_path, "\n",
+      "Checked directory: ", db_dir, "\n",
+      "No close match found for: ", db_file, "\n",
+      "Tip: create a symlink or rename the file to match."
     )
-  ))
+  }
+
+  resolved <- file.path(db_dir, hit[1])
+  message("connect_convert_db_org: using resolved file: ", hit[1])
+  DBI::dbConnect(RSQLite::SQLite(), dbname = resolved, flags = RSQLite::SQLITE_RO)
 }
+
+
 
 
 # keggSpeciesID = read.csv(paste0(datapath,"data_go/KEGG_Species_ID.csv"))

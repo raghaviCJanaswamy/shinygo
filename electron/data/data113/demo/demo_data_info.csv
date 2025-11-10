@@ -1,0 +1,23 @@
+ID,expression,design,type,name,species,memo,ncbi,Note
+12,GSE37704_sailfish_genecounts.csv,,1,2 groups,Human,Cells treated with RNAi (Hoxa1 knockdown) or random nucleotides. 3 replicates each.,GSE37704,ID column must be unique
+18,GSE112661.csv,GSE112661_design.csv,1,2x2 factorial design (mutant treatment),Human,Wildtype (WT) and mutant (Mu) thyroid cell lines treated with Tunicamycin. ,GSE112661,Species name must match species name in the orgInfo
+17,GSE146532.csv,GSE146532_design.csv,1,"3x2x4 factorial design (large, 119 samples)",Human,"Bronchial epithelial cells from an adult cohort including asthmatics, COPD and healthy controls, cultured with Rhinovirus 1A. ",GSE146532,
+1,GSE71176_IR_vs_mock_ensembl.csv,,1,2 groups,Mouse,Ionizing radiation vs mock treatment.,GSE71176,
+2,BcellGSE71176_p53_3groups.csv,,1,3 groups,Mouse,"Three groups: wild-type, p53 mutant, and wild-type with radiation.",GSE71176,
+3,BcellGSE71176_p53_two_groups.csv,design_two_group_paired.csv,1,2 groups  paired,Mouse,Hoxa1 knockdown with RNAi vs control. Paired. The experiment was repeated three times over time.,GSE71176,
+4,BcellGSE71176_p53.csv,BcellGSE71176_p53_sampleInfo.csv,1,2x2 factorial design,Mouse,Effect of ionizing radiation on wild-type and p53 mutant mice.,GSE71176,
+5,BcellGSE71176_p53.csv,BcellGSE71176_p53_sampleInfo_2x3.csv,1,2x3 factorial design,Mouse,The effect of ionizing radiation on three genoetypes. ,GSE71176,
+6,GSE106223_arabidopsis.csv,GSE106223_4x2design.csv,1,4x2 factorial design,Arabidopsis thaliana,Four genotypes over two time points. ,GSE106223,
+7,BcellGSE71176_p53.csv,BcellGSE71176_p53_sampleInfo_3factors.csv,1,3-factor design,Mouse,"2 genotypes, 2 treatment conditions, plus sex as a batch factor.",GSE71176,
+8,GSE104916_2x2x2_arabidopsis_root.csv,GSE104916_2x2x2design_root.csv,1,3-factor design ,Arabidopsis thaliana,"Two genotypes. Two types of nutrient deficiencies (Cu, Fe).",GSE104916,
+9,GSE104916_2x2x2x2_arabidopsis.csv,GSE104916_2x2x2x2design.csv,1,4-factor design,Arabidopsis thaliana,"Two genotypes. Two types of nutrient deficiencies (Cu, Fe). Studied root and leaves.",GSE104916,
+10,GSE100007.csv,GSE100007_design.csv,1,"Large data, no design file (40 samples)",Human,Multiple types of RNAs in different cell lines.,GSE100007,
+11,GSE37704_Hoxa1_normalized.csv,,2,2 groups normalized,Human,Log-transformed counts per million.,GSE37704,
+13,BcellGSE71176_p53_normalized.csv,BcellGSE71176_p53_sampleInfo.csv,2,2x2 factorial design,Mouse,Log-transformed counts per million. Radiation in wildtype and mutant.,GSE71176,
+14,GSE71176_p53_LFC_FDR_single.csv,,3,Log fold-changes and Pvals,Mouse,Radiation vs mock treatment.,GSE71176,
+15,GSE71176_p53_LFC_FDR.csv,,3,3 Log fold-changes and Pvals,Mouse,Three comparisons: Wildtype vs p53-/-. Radiation vs mock. p53-dependent response to radiation (interaction),GSE71176,
+19,GSE146532_log2fold_FDR.csv,,3,3 Log fold-changes and Pvals,Human,"Comparison amoung three groups COPD, Asthma, Healthy without infection.",GSE146532,
+21,GSE146532_time_LFC_Pval.csv,,3,4 Log fold-changes and Pvals (time series),Human,"Asthma cultured cell infected with rhinovirus (24hr, 48hr, 72hr, 96hr)",GSE146532,
+22,GSE146532_time_LFC.csv,,4,4 Log fold-changes (time series),Human,"Asthma cultured cell infected with rhinovirus (24hr, 48hr, 72hr, 96hr)",GSE146532,
+20,GSE146532_log2fold.csv,,4,3 Log fold-changes,Human,"Comparison amoung three groups COPD, Asthma, Healthy without infection.",GSE146532,
+16,GSE71176_p53_LFC_only.csv,,4,3 log fold-changes,Mouse,Three comparisons: Wildtype vs p53-/-. Radiation vs mock. p53-dependent response to radiation (interaction),GSE71176,

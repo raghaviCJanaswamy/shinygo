@@ -1,0 +1,3 @@
+,WT_DMSO_Day7_rep1,WT_DMSO_Day7_rep2,WT_DMSO_Day7_rep3,WT_Tunica_Day7_rep2,WT_Tunica_Day7_rep3,Mu_DMSO_Day7_rep1,Mu_DMSO_Day7_rep2,Mu_DMSO_Day7_rep3,Mu_Tunica_Day7_rep1,Mu_Tunica_Day7_rep2
+genotype,WT,WT,WT,WT,WT,Mu,Mu,Mu,Mu,Mu
+treatment, DMSO, DMSO, DMSO, Tunica, Tunica, DMSO, DMSO, DMSO, Tunica, Tunica
