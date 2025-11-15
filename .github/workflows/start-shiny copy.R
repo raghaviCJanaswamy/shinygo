@@ -1,5 +1,17 @@
 #!/usr/bin/env Rscript
 
+# start-shiny.R
+
+
+
+
+
+
+.libPaths(c(Sys.getenv("R_LIBS_USER"), .libPaths()))
+Sys.setenv(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", OMP_WAIT_POLICY="PASSIVE")
+options(error = function(e){ writeLines(paste("FATAL:", conditionMessage(e))); q(status=1) })
+
+
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 2) {
   stop("Usage: start-shiny.R <app_root> <user_data_dir>")
@@ -254,21 +266,31 @@ suppressPackageStartupMessages({
   library(shiny)
   library(DBI)
   library(RSQLite)
+  library(httpuv)
 })
 
-# -----------------------------------------------------------------------------
-# 5) Start Shiny app
-# -----------------------------------------------------------------------------
+## ---------- Launch Shiny app ----------
+# random free port; Electron watches for this exact marker
 port <- httpuv::randomPort()
+options(shiny.host = "127.0.0.1", shiny.port = port)
+cat(sprintf("[APP] USING_PORT %d\n", port)); flush.console()
 
-options(shiny.port = port, shiny.host = "127.0.0.1")
-
-log("[APP] USING_PORT %d", port)   
+# Ensure relative sources/files work as in RStudio run
 setwd(app_root)
 
-shiny::runApp(
-  appDir = app_root,
-  host = "127.0.0.1",
-  port = port,
-  launch.browser = FALSE
-)
+# If your app has app.R at app_root, run it directly.
+# Otherwise, set ui/server by sourcing ui.R and server.R in app_root.
+if (file.exists(file.path(app_root, "app.R"))) {
+  cat("[R] Running app.R...\n"); flush.console()
+  shiny::runApp(appDir = app_root, launch.browser = FALSE)
+} else {
+  cat("[R] Running ui.R/server.R...\n"); flush.console()
+ui <- server <- NULL
+  if (file.exists(file.path(app_root, "global.R"))) source(file.path(app_root, "global.R"), chdir = TRUE)
+  if (file.exists(file.path(app_root, "ui.R")))     source(file.path(app_root, "ui.R"),     chdir = TRUE)
+  if (file.exists(file.path(app_root, "server.R"))) source(file.path(app_root, "server.R"), chdir = TRUE)
+  stopifnot(inherits(shiny::shinyApp(ui = ui, server = server), "shiny.appobj"))
+  shiny::runApp(shiny::shinyApp(ui = ui, server = server), launch.browser = FALSE)
+}
+
+cat("[R] runApp returned (server exited)\n"); flush.console()

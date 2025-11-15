@@ -1,371 +1,256 @@
-const { request } = require('undici');
-const tar = require('tar');
+// main.js
+const { app, BrowserWindow } = require("electron");
+const { spawn } = require("node:child_process");
+const path = require("node:path");
+  const fs = require("node:fs");
+const net = require("node:net");
 
-const DB_VER = process.env.IDEP_DB_VER || 'data113';
-const DB_BASE_URL = process.env.IDEP_DB_URL || 'http://bioinformatics.sdstate.edu/data/';
-
-// ==== Electron main =========================================================
-const { app, BrowserWindow, dialog, shell } = require('electron');
-const path = require('path');
-const { spawn, execSync } = require('child_process');
-const fs = require('fs-extra');
-
-let shinyProc = null;
-let shinyPort = null;
-let mainWindow = null;
-
-const isWin = process.platform === 'win32';
-const isMac = process.platform === 'darwin';
-const isLinux = process.platform === 'linux';
-const isDev = !app.isPackaged;
-
-// ---------- small helpers ----------
-function appRootPath() {
-  // dev: repo root; prod: resources/app (keep Shiny app outside asar)
-  return isDev ? path.join(__dirname, '..', '..')
-               : path.join(process.resourcesPath, 'app');
-}
-
-function parsePortFrom(txt) {
-  let m = /Listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(txt);
-  if (m) return m[1];
-  m = /\[APP\]\s+USING_PORT\s+(\d+)/.exec(txt);
-  if (m) return m[1];
+function resolveFirstExisting(list) {
+  for (const p of list) if (fs.existsSync(p)) return p;
   return null;
 }
-
-async function attachLogging(child) {
-  const logFile = path.join(app.getPath('userData'), 'shiny-backend.log');
-  await fs.ensureFile(logFile);
-
-  const write = async (buf) => {
-    const txt = buf.toString();
-    await fs.appendFile(logFile, txt);
-    if (!shinyPort) {
-      const p = parsePortFrom(txt);
-      if (p) { shinyPort = p; createWindow(); }
-    }
-  };
-
-  child.stdout.on('data', write);
-  child.stderr.on('data', write);
-  child.on('exit', async (code) => {
-    await fs.appendFile(logFile, `\n[MAIN] backend exited with code ${code}\n`);
-    if (!shinyPort) {
-      dialog.showErrorBox('Shiny backend failed', `See log:\n${logFile}`);
-      app.quit();
-    }
-  });
-
-  // pop open the log if backend hasn’t started after 2 minutes
-  setTimeout(() => { if (!shinyPort) shell.showItemInFolder(logFile); }, 120000);
+function resourcesBase() {
+  return app.isPackaged ? process.resourcesPath : path.resolve(__dirname, "..");
 }
 
-// ---------- R runtime discovery (platform-aware) ----------
-async function normalizeRuntime(runtimeDir) {
-  const rDir = path.join(runtimeDir, 'R');
+function locateRuntimeAndApp() {
+  const base = resourcesBase();
 
-  // Flatten .../R/R-full/* -> .../R/*
-  const rFull = path.join(rDir, 'R-full');
-  if (await fs.pathExists(path.join(rFull, 'bin'))) {
-    for (const name of await fs.readdir(rFull)) {
-      await fs.move(path.join(rFull, name), path.join(rDir, name), { overwrite: true });
-    }
-    await fs.remove(rFull);
+  const rHome = resolveFirstExisting([
+    path.join(base, "runtime", "win", "R"),
+    path.join(base, "app", "runtime", "win", "R"),
+  ]);
+  if (!rHome) throw new Error("Bundled R runtime not found.");
+
+  // Prefer 64-bit Rscript
+  const rExec64 = path.join(rHome, "bin", "x64", "Rscript.exe");
+  const rExec = fs.existsSync(rExec64) ? rExec64 : path.join(rHome, "bin", "Rscript.exe");
+
+  const rLib  = path.join(rHome, "library");
+  if (!fs.existsSync(rExec)) throw new Error(`Rscript.exe missing at: ${rExec}`);
+  if (!fs.existsSync(rLib))  throw new Error(`R library dir missing at: ${rLib}`);
+
+  const appDir = resolveFirstExisting([
+    path.join(base, "shinyapp"),
+    path.join(base, "resources", "shinyapp"),
+    path.join(base, "app", "resources", "shinyapp"),
+  ]);
+  if (!appDir) throw new Error("Shiny app folder not found.");
+
+  for (const f of ["server.R", "ui.R"]) {
+    const p = path.join(appDir, f);
+    if (!fs.existsSync(p)) throw new Error(`Missing ${f} in app: ${p}`);
   }
 
-  // Flatten accidental double R: .../R/R/* -> .../R/*
-  const nestedR = path.join(rDir, 'R');
-  if (await fs.pathExists(path.join(nestedR, 'bin'))) {
-    for (const name of await fs.readdir(nestedR)) {
-      await fs.move(path.join(nestedR, name), path.join(rDir, name), { overwrite: true });
-    }
-    await fs.remove(nestedR);
-  }
+  // Data root that global.R should use
+  const dataRoot = path.join(base, "data"); // <resources>/data
+
+  return { rHome, rExec, rLib, appDir, base, dataRoot };
 }
 
-// Return the directory that directly contains the R folder (…/R/…)
-// Replace your ensureRuntimeDir() with this
-async function ensureRuntimeDir() {
-  const platformSub = process.platform === 'win32' ? 'win' : process.platform === 'darwin' ? 'mac' : 'linux';
+// Ensure the layout nudges global.R to download if db/ is missing
+function preflightData(dataRoot, logFile) {
+  const verDir  = path.join(dataRoot, "data113");
+  const demoOrg = path.join(verDir, "demo", "orgInfo.db");
+  const dbDir   = path.join(verDir, "db");
 
-  const quick = [
-    path.join(process.resourcesPath, 'runtime', platformSub),     // resources/runtime/win
-    path.join(app.getPath('userData'), 'runtime', platformSub),   // userData/runtime/win
-    path.join(appRootPath(), 'electron', 'runtime', platformSub), // dev/electron/runtime/win
-    path.join(process.resourcesPath, 'runtime')                   // resources/runtime (no sub)
-  ];
-
-  for (const base of quick) {
-    const rDir = path.join(base, 'R');
-    if (fs.existsSync(path.join(rDir, 'bin'))) {
-      await normalizeRuntime(base);
-      return base;
-    }
-  }
-
-  // recursive search under likely roots
-  const roots = [
-    path.join(process.resourcesPath, 'runtime'),
-    path.join(app.getPath('userData'), 'runtime'),
-    path.join(appRootPath(), 'electron', 'runtime')
-  ];
-
-  for (const root of roots) {
-    if (!fs.existsSync(root)) continue;
-    const stack = [root];
-    while (stack.length) {
-      const dir = stack.pop();
-      let ents = [];
-      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-
-      // does this dir contain R/bin/Rscript(.exe)?
-      const rBin = path.join(dir, 'R', 'bin');
-      const rscript = path.join(rBin, process.platform === 'win32' ? 'Rscript.exe' : 'Rscript');
-      if (fs.existsSync(rscript)) {
-        await normalizeRuntime(dir);
-        return dir; // <- this directory directly contains R/
-      }
-
-      for (const e of ents) if (e.isDirectory()) stack.push(path.join(dir, e.name));
-    }
-  }
-
-  const tried = quick.concat(roots).map(p => `  - ${p}`).join('\n');
-  throw new Error(`No R runtime found. Expected at one of:\n${tried}`);
-}
-
-
-
-function assertRuntimeLooksRight(runtimeDir) {
-  const R_HOME = path.join(runtimeDir, 'R');
-  const rscript = path.join(R_HOME, 'bin', isWin ? 'Rscript.exe' : 'Rscript');
-  const rDll64  = isWin ? path.join(R_HOME, 'bin', 'x64', 'R.dll') : null;
-
-  const missing = [R_HOME, rscript].filter(p => !fs.existsSync(p));
-  if (isWin && !fs.existsSync(rDll64)) missing.push(rDll64);
-
-  if (missing.length) {
-    throw new Error(
-      'R runtime looks incomplete. Missing:\n' +
-      missing.map(p => `  - ${p}`).join('\n') +
-      '\nExpected layout: runtime/<win|mac|linux>/R/bin/...'
-    );
-  }
-}
-
-// probe a binary to ensure it runs and prints OK
-async function probe(binaryPath, env, kind) {
-  const args = kind === 'rscript'
-    ? ['-e', 'cat("OK")']
-    : ['--vanilla', '--slave', '-e', 'cat("OK")'];
-
-  return await new Promise((resolve) => {
-    const p = spawn(binaryPath, args, { env, windowsHide: true, shell: false });
-    let out = '', err = '';
-    p.stdout.on('data', b => out += b.toString());
-    p.stderr.on('data', b => err += b.toString());
-    p.on('exit', code => resolve({ code, out: out.trim(), err: err.trim() }));
-  });
-}
-
-async function findWorkingRBinary(runtimeDir, env) {
-  const R_HOME = path.join(runtimeDir, 'R');
-  const bin    = path.join(R_HOME, 'bin');
-  const bin64  = path.join(bin, 'x64');
-
-  const cand = isWin ? [
-    { p: path.join(bin64, 'Rscript.exe'), kind: 'rscript' },
-    { p: path.join(bin,   'Rscript.exe'), kind: 'rscript' },
-    { p: path.join(bin64, 'Rterm.exe'),   kind: 'rterm'   },
-    { p: path.join(bin64, 'R.exe'),       kind: 'rterm'   },
-    { p: path.join(bin,   'Rterm.exe'),   kind: 'rterm'   },
-    { p: path.join(bin,   'R.exe'),       kind: 'rterm'   },
-  ] : [
-    { p: path.join(bin, 'Rscript'), kind: 'rscript' },
-    { p: path.join(bin, 'R'),       kind: 'rterm'   },
-  ];
-
-  for (const c of cand) {
-    if (!fs.existsSync(c.p)) continue;
-    const t = await probe(c.p, env, c.kind);
-    if (t.code === 0 && /OK/.test(t.out)) return c;
-  }
-
-  // show the first failure with details
-  for (const c of cand) {
-    if (fs.existsSync(c.p)) {
-      const t = await probe(c.p, env, c.kind);
-      throw new Error(
-        `R probe failed for ${c.p}\nexit=${t.code}\nstdout=${t.out}\nstderr=${t.err}\n` +
-        `PATH=${env.PATH}\nR_HOME=${env.R_HOME}\n`
-      );
-    }
-  }
-  throw new Error('No R binary found in runtime.');
-}
-
-function argsFor(kind, startShinyScript, appRoot, userDataDir) {
-  return kind === 'rscript'
-    ? [startShinyScript, appRoot, userDataDir]
-    : ['--vanilla', '--slave', '-f', startShinyScript, '--args', appRoot, userDataDir];
-}
-
-// Build the environment block that prevents DLL load crashes on Windows
-function buildREnv(runtimeDir, userDataDir, dbRoot) {
-  const R_HOME = path.join(runtimeDir, 'R');
-  const bin    = path.join(R_HOME, 'bin');
-  const bin64  = path.join(bin, 'x64');
-  const PATH   = [bin, fs.existsSync(bin64) ? bin64 : null, process.env.PATH || '']
-                  .filter(Boolean).join(path.delimiter);
-
-  const env = {
-    ...process.env,
-    R_HOME,
-    R_ARCH: isWin ? 'x64' : undefined,
-    R_USER: userDataDir,
-    R_LIBS_USER: path.join(R_HOME, 'library'),
-    PATH
-  };
-
-  // IDEP database root (this is what your global.R expects)
-  if (dbRoot) env.IDEP_DATABASE = dbRoot;
-  env.IDEP_DB_VER = DB_VER;
-
-  return env;
-}
-
-// ---- Robust local DB finder (no download) ----------------------------------
-const CANDIDATE_DATA_SUBDIR = path.join('data113', 'demo', 'orgInfo.db');
-
-async function findExistingDatabase(app_, fs_, path_) {
-  const roots = [
-    path_.join(process.resourcesPath, 'data'),
-    path_.join(process.resourcesPath, 'app', 'electron', 'data'),
-    path_.join(process.resourcesPath, 'app', 'data'),
-    path_.join(app_.getPath('userData'), 'resources', 'data'),
-    path_.join(app_.getPath('userData'), 'data'),
-    app_.getPath('userData')
-  ];
-
-  const logFile = path_.join(app_.getPath('userData'), 'shiny-backend.log');
-  try { await fs_.ensureFile(logFile); } catch {}
-  const log = async (s) => { try { await fs_.appendFile(logFile, s + '\n'); } catch {} };
-
-  for (const root of roots) {
-    const p = path_.join(root, CANDIDATE_DATA_SUBDIR);
-    if (fs_.existsSync(p)) { await log(`[DB] Found orgInfo at: ${p}`); return root; }
-    const nested = path_.join(root, 'electron', CANDIDATE_DATA_SUBDIR);
-    if (fs_.existsSync(nested)) { await log(`[DB] Found orgInfo at (electron/...): ${nested}`); return path_.join(root, 'electron'); }
-  }
-
-  // recursive last resort
   try {
-    let hit = null;
-    const walk = (dir) => {
-      const ents = fs_.readdirSync(dir, { withFileTypes: true });
-      for (const e of ents) {
-        const f = path_.join(dir, e.name);
-        if (e.isDirectory()) walk(f);
-        else if (e.isFile() && e.name.toLowerCase() === 'orginfo.db') { hit = f; throw new Error('__FOUND__'); }
-      }
-    };
-    walk(process.resourcesPath);
-  } catch (e) {
-    if (String(e.message) === '__FOUND__') {
-      const hitDir = path_.dirname(path_.dirname(path_.dirname(hit))); // …/data/data113
-      const dbRoot = path_.dirname(hitDir);                            // …/data
-      if (dbRoot && fs_.existsSync(dbRoot)) {
-        await fs_.appendFile(path_.join(app_.getPath('userData'), 'shiny-backend.log'),
-          `[DB] Found by recursive search: ${hit}\n[DB] Using dbRoot: ${dbRoot}\n`);
-        return dbRoot;
-      }
-    }
-  }
+    fs.mkdirSync(dataRoot, { recursive: true });
+    fs.mkdirSync(verDir,   { recursive: true });
 
-  throw new Error(
-    `iDEP database not found. Looked for ${CANDIDATE_DATA_SUBDIR} under:\n` +
-    `- ${path_.join(process.resourcesPath, 'data')}\n` +
-    `- ${path_.join(process.resourcesPath, 'app', 'electron', 'data')}\n` +
-    `- ${path_.join(process.resourcesPath, 'app', 'data')}\n` +
-    `Ensure resources/data/data113/... is packaged.`
+    if (fs.existsSync(dbDir)) {
+      fs.appendFileSync(logFile, `[NODE][preflight] db/ present at ${dbDir}\n`);
+      return;
+    }
+
+    // If only demo is present, remove orgInfo.db so global.R triggers the download
+    if (fs.existsSync(demoOrg)) {
+      fs.appendFileSync(logFile, `[NODE][preflight] removing demo orgInfo.db to trigger download: ${demoOrg}\n`);
+      fs.unlinkSync(demoOrg);
+    } else {
+      fs.appendFileSync(logFile, `[NODE][preflight] no db/ and no demo orgInfo.db; download should trigger\n`);
+    }
+  } catch (e) {
+    // non-fatal; R will still try and then fail with a clear message if needed
+    try { fs.appendFileSync(logFile, `[NODE][preflight] warning: ${String(e)}\n`); } catch {}
+    console.warn("[preflightData] warning:", e);
+  }
+}
+
+function waitForPort(host, port, timeoutMs = 60000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    (function tryOnce() {
+      const s = net.connect({ host, port }, () => { s.end(); resolve(); });
+      s.on("error", () => {
+        s.destroy();
+        if (Date.now() - start > timeoutMs) reject(new Error(`Timed out waiting for ${host}:${port}`));
+        else setTimeout(tryOnce, 300);
+      });
+    })();
+  });
+}
+
+function launchShiny(port) {
+  const { rHome, rExec, rLib, appDir, base, dataRoot } = locateRuntimeAndApp();
+
+  const logFile = path.join(app.getPath("userData"), "shiny-startup.log");
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+
+  fs.writeFileSync(
+    logFile,
+    [
+    "=== Shiny bootstrap ===",
+    `isPackaged: ${app.isPackaged}`,
+    `resourcesBase: ${base}`,
+    `Rscript: ${rExec}`,
+    `Rlib   : ${rLib}`,
+    `appDir : ${appDir}`,
+    `dataRoot: ${dataRoot}`,
+    "=======================",
+    ""
+    ].join("\n"),
+    "utf8"
   );
-}
 
-// ---- Start Shiny -----------------------------------------------------------
-async function startShiny(runtimeDir, dbRoot) {
-  assertRuntimeLooksRight(runtimeDir);
+  // Make sure data layout will cause global.R to download if needed
+  preflightData(dataRoot, logFile);
 
-  const appRoot     = appRootPath();
-  const userDataDir = app.getPath('userData');
-  const env         = buildREnv(runtimeDir, userDataDir, dbRoot);
+  // R code: log early arch info BEFORE sink, then sink everything to file
+  const runCode = `
+    logf <- "${logFile.replace(/\\/g, "/")}"
 
-  // prefer a launcher that actually runs on THIS machine/layout
-  const { p: rbin, kind } = await findWorkingRBinary(runtimeDir, env);
+    # Early diagnostics BEFORE sink (helps if R crashes early)
+    try(cat("[R] starting Rscript…\\n"), silent=TRUE)
+    try(cat("[R] R.home(): ", R.home(), "\\n", sep=""), silent=TRUE)
+    try(cat("[R] R.version$arch: ", R.version$arch, "\\n", sep=""), silent=TRUE)
 
-  const startShinyScript = isDev
-    ? path.join(appRoot, 'start-shiny.R')
-    : path.join(process.resourcesPath, 'app', 'start-shiny.R');
+    # Redirect all output to the log
+    con <- file(logf, open="at"); sink(con, split=TRUE); sink(con, type="message", split=TRUE)
 
-  const args = argsFor(kind, startShinyScript, appRoot, userDataDir);
+    .libPaths(c("${rLib.replace(/\\/g, "/")}"))
+    Sys.setenv(
+      R_HOME        = "${rHome.replace(/\\/g, "/")}",
+      R_LIBS        = "${rLib.replace(/\\/g, "/")}",
+      R_LIBS_USER   = "${rLib.replace(/\\/g, "/")}",
+      IDEP_DATABASE = "${dataRoot.replace(/\\/g, "/")}"
+    )
+    
+    options(
+      repos = c(CRAN="https://cloud.r-project.org"),
+      shiny.port = ${port},
+      shiny.host = "127.0.0.1",
+      timeout = 600,
+      download.file.method = "libcurl"
+    )
 
-  shinyProc = spawn(rbin, args, { cwd: appRoot, env, windowsHide: true });
-  attachLogging(shinyProc);
-  if (!mainWindow) createWindow();
-}
+    dir.create(file.path(Sys.getenv("IDEP_DATABASE"), "data113"), recursive=TRUE, showWarnings=FALSE)
 
-// ---- Window / lifecycle ----------------------------------------------------
-function createWindow() {
-  if (mainWindow) return;
+    cat("[R] IDEP_DATABASE: ", Sys.getenv("IDEP_DATABASE"), "\\n"); flush.console()
+    cat("[R] getwd: ", getwd(), "\\n"); flush.console()
+    cat("[R] .libPaths: ", paste(.libPaths(), collapse="; "), "\\n"); flush.console()
 
-  mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
-    show: true,
-    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
-  });
+    # quick network probe to the tarball (logs connectivity only)
+    cat("[R] network probe to data URL...\\n"); flush.console()
+    tryCatch({
+      u <- url("http://bioinformatics.sdstate.edu/data/data113/data113.tar.gz", "rb"); close(u)
+      cat("[R] probe OK\\n"); flush.console()
+    }, error=function(e) {
+      cat("[R] probe failed: ", conditionMessage(e), "\\n"); flush.console()
+    })
 
-  const url = shinyPort
-    ? `http://127.0.0.1:${shinyPort}`
-    : 'data:text/html,<h3>Starting Shiny backend...</h3>';
-
-  mainWindow.loadURL(url);
-  mainWindow.on('closed', () => { mainWindow = null; });
-}
-
-function killChild() {
-  if (!shinyProc) return;
-  try {
-    if (isWin) execSync(`taskkill /pid ${shinyProc.pid} /T /F`);
-    else shinyProc.kill('SIGTERM');
-  } catch {}
-  shinyProc = null;
-}
-
-// ---- Single-instance + startup chain --------------------------------------
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
+    req <- c("shiny","httpuv","RSQLite","DBI","dplyr","tidyr","DT","plotly",
+             "visNetwork","igraph","dendextend","ggplot2","gridExtra",
+             "shinyBS","reactable","shinybusy")
+    for (p in req) {
+      cat("[R] loading: ", p, "…\\n"); flush.console()
+      suppressPackageStartupMessages(library(p, character.only=TRUE))
     }
+
+    setwd("${appDir.replace(/\\/g, "/")}")
+    cat("[R] app files: ", paste(list.files(".", recursive=TRUE), collapse=", "), "\\n"); flush.console()
+    cat("[R] running app…\\n"); flush.console()
+
+    shiny::runApp(".", launch.browser=FALSE)
+  `;
+
+  const rBin    = path.join(rHome, "bin");
+  const rBinX64 = path.join(rHome, "bin", "x64");
+
+  fs.appendFileSync(
+    logFile,
+    `[NODE] about to spawn R\n` +
+    `[NODE] process.resourcesPath = ${process.resourcesPath}\n` +
+    `[NODE] dataRoot (resources/data) = ${dataRoot}\n` +
+    `[NODE] (child env) IDEP_DATABASE = ${dataRoot}\n\n`,
+    "utf8"
+  );
+
+  // NOTE: x64 FIRST on PATH; export R_ARCH=x64
+  const child = spawn(
+    rExec,
+    ["--no-restore", "--no-save", "--no-site-file", "--no-init-file", "-e", runCode],
+    {
+      stdio: ["ignore", "ignore", "ignore"],   // all R output goes to the log via sink()
+    windowsHide: true,
+    env: {
+      ...process.env,
+        PATH: [rBinX64, rBin, process.env.PATH || ""].join(path.delimiter),
+        R_HOME: rHome,
+        R_LIBS: rLib,
+        R_LIBS_USER: rLib,
+        R_ARCH: "x64",               // <- critical to avoid 32/64-bit DLL mismatches
+        IDEP_DATABASE: dataRoot      // reinforce for child process
+      }
+    }
+  );
+
+  child.on("exit", code => fs.appendFileSync(logFile, `\n[R EXIT] ${code}\n`, "utf8"));
+
+  const isReady = async () => {
+    try { await waitForPort("127.0.0.1", port, 1000); return true; } catch { return false; }
+  };
+
+  return { child, logFile, isReady, getErr: () => "", getOut: () => "" };
+}
+
+async function createWindow() {
+  const port = 39845;
+  let proc;
+  const win = new BrowserWindow({ width: 1200, height: 800, webPreferences: { contextIsolation: true } });
+
+  try {
+    proc = launchShiny(port);
+    // poll until port is open (Shiny bound)
+    const start = Date.now();
+    while (!(await proc.isReady())) {
+      if (Date.now() - start > 60000) throw new Error("Timed out waiting for Shiny to bind the port");
+      await new Promise(r => setTimeout(r, 300));
+    }
+    await win.loadURL(`http://127.0.0.1:${port}/`);
+  } catch (err) {
+    const msg = [
+      "Failed to start Shiny.",
+      "",
+      String(err),
+      "",
+      "See log file:",
+      proc?.logFile || "(no log file)",
+      "",
+      "STDERR:",
+      "(empty)",
+      "",
+      "STDOUT:",
+      "(empty)"
+    ].join("\n");
+    await win.loadURL("data:text/plain," + encodeURIComponent(msg));
+  }
+
+  win.on("closed", () => {
+    if (proc?.child && !proc.child.killed) { try { proc.child.kill(); } catch(_) {} }
   });
 }
 
-app.whenReady().then(async () => {
-  try {
-    const runtimeDir = await ensureRuntimeDir();                 // ← returns .../runtime/<os>
-    const dbRoot     = await findExistingDatabase(app, fs, path); // ← use FOUND DB path
-    await startShiny(runtimeDir, dbRoot);
-  } catch (e) {
-    dialog.showErrorBox('Startup error', String(e && e.stack || e));
-    app.quit();
-  }
-});
-
-app.on('before-quit', killChild);
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('activate', () => { if (mainWindow === null) createWindow(); });
+app.whenReady().then(createWindow);
+app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

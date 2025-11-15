@@ -29,43 +29,42 @@
     "directories": {
       "buildResources": "build"  
     },
-    "files": [      
-      "main.js",
-      "start-shiny.R",
-      "package.json",
-      "node_modules/**",          
-      "!scripts/**",
-      "!resources/data/**"
-    ],
     "asar": false,
-    "asarUnpack": [
-      "runtime/**",
-      "data/**",
-      "app/**"
+    "files": [    
+      "main.js",
+      "preload/**",
+      "renderer/**",
+      "node_modules/**",
+      "package.json",
+      "!resources/**",
+      "!runtime/**"
     ],
     "extraResources": [
-      { "from": "resources/data", "to": "data" },
-      { "from": "runtime/win", "to": "runtime/win" },
-      { "from": "../app", "to": "app" }
+      { "from": "resources", "to": "." },  
+      { "from": "runtime",   "to": "runtime" } ,
+      { "from": "data",   "to": "data" } 
     ],
-    "mac": {
-      "category": "public.app-category.education",
-      "target": ["dmg", "zip"],
-      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
-      "entitlements": "entitlements.mac.plist",
-      "gatekeeperAssess": false
-    },
+
     "win": {
       "target": [
         { "target": "nsis", "arch": ["x64"] }
       ],
       "artifactName": "${productName}-${version}-win-${arch}.${ext}"
     },
+
+    "mac": {
+      "category": "public.app-category.education",
+      "target": ["dmg", "zip"],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
+      "gatekeeperAssess": false
+    },
+
     "linux": {
       "category": "Education",
       "target": ["AppImage", "deb"],
       "artifactName": "${productName}-${version}-linux-${arch}.${ext}"
     },
+
     "nsis": {
       "oneClick": true,
       "perMachine": false,

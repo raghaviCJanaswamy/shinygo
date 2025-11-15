@@ -6,7 +6,7 @@ on:
   pull_request:
 
 env:
-  R_VERSION: 4.4.2
+  R_VERSION: 4.4.3
 
 jobs:
   build-windows:
@@ -33,31 +33,131 @@ jobs:
         working-directory: electron/scripts
         run: |
           ./get_r_windows.ps1
-          New-Item -ItemType Directory -Force ../runtime/win | Out-Null
-          Copy-Item -Recurse -Force r-win/R ../runtime/win/R
 
       - name: Verify R runtime exists
         shell: pwsh
         working-directory: electron
         run: |
-          $r = Get-ChildItem -Recurse -Path runtime\win -Filter Rscript.exe -File | Select-Object -First 1
-          if (-not $r) { throw "Rscript.exe not found under electron/runtime/win" }
-          Write-Host "Found Rscript at: $($r.FullName)"
+          if (-not (Test-Path "runtime\win\R\bin\Rscript.exe")) {
+            throw "Missing electron\runtime\win\R\bin\Rscript.exe"
+          }
+          Write-Host "Found:" (Resolve-Path runtime\win\R\bin\Rscript.exe)
 
-      # ----------------- Preinstall R packages into bundled library -----------------
+# ----------------- Install R packages into the BUNDLED library -----------------
       - name: Install R packages (Windows)
         working-directory: electron/scripts
         shell: pwsh
         run: |
-          $root = Resolve-Path "../runtime/R"
-          $rscript = Get-ChildItem -Recurse -Path $root -Filter Rscript.exe -File | Select-Object -First 1
-          if (-not $rscript) { throw "Rscript.exe not found anywhere under $root" }
+          $root    = Resolve-Path "../runtime/win/R"
+          $rscript = Join-Path $root "bin/Rscript.exe"
+          if (-not (Test-Path $rscript)) { throw "Rscript.exe not found at $rscript" }
+
           $LIB = Join-Path $root "library"
           New-Item -ItemType Directory -Force -Path $LIB | Out-Null
-          & $rscript.FullName "setup-r-lib.R" $root $LIB
 
-      # (ZIP STEP REMOVED) — runtime stays as a plain folder for packaging
+          $installer = Resolve-Path "../../install_pckages.R"
+          if (-not (Test-Path $installer)) { throw "install_pckages.R not found at repo root" }
 
+          # Write a robust wrapper that (1) pins lib paths, (2) sources your script,
+          # then (3) guarantees required packages are installed into $LIB.
+          $wrap = @'
+          args <- commandArgs(TRUE)
+          R_HOME <- normalizePath(args[1], winslash="\\", mustWork=TRUE)
+          R_LIB  <- normalizePath(args[2], winslash="\\", mustWork=TRUE)
+          INST   <- normalizePath(args[3], winslash="\\", mustWork=TRUE)
+
+          dir.create(R_LIB, recursive=TRUE, showWarnings=FALSE)
+          # Force all installs to the bundled lib:
+          .libPaths(c(R_LIB))
+          Sys.setenv(R_HOME = R_HOME, R_LIBS = R_LIB, R_LIBS_USER = R_LIB)
+          options(repos = c(CRAN = "https://cloud.r-project.org"),
+                  pkgType = "binary",
+                  Ncpus = max(1L, parallel::detectCores(logical=TRUE) - 1L))
+
+          message("[SETUP] .libPaths(): ", paste(.libPaths(), collapse="; "))
+
+          # 1) Run YOUR installer (it may install extra pkgs)
+          if (file.exists(INST)) {
+            message("[SETUP] Sourcing installer: ", INST)
+            source(INST, local=TRUE)
+          }
+
+          # 2) Ensure these critical deps are present (idempotent)
+          required <- c("shiny","httpuv","RSQLite","DBI","dplyr","tidyr","DT","plotly",
+                        "visNetwork","igraph","dendextend","ggplot2","gridExtra",
+                        "shinyBS","reactable","shinybusy")
+          installed <- rownames(installed.packages(lib.loc=R_LIB))
+          missing <- setdiff(required, installed)
+          if (length(missing)) {
+            message("[SETUP] Installing missing: ", paste(missing, collapse=", "))
+            install.packages(missing, lib=R_LIB, dependencies=c("Depends","Imports","LinkingTo"))
+          } else {
+            message("[SETUP] All required packages already present.")
+          }
+
+          # 3) Print summary and fail early if anything still missing
+          installed2 <- rownames(installed.packages(lib.loc=R_LIB))
+          still <- setdiff(required, installed2)
+          message("[SETUP] Final library: ", R_LIB)
+          if (length(still)) {
+            stop("Packages still missing after install: ", paste(still, collapse=", "))
+          }
+          message("[SETUP] Package install OK")
+          '@
+
+          $wrapFile = Join-Path (Get-Location) "wrap-install.R"
+          Set-Content -Path $wrapFile -Value $wrap -Encoding UTF8
+
+          # IMPORTANT: set env so child process defaults are the bundled lib.
+          $env:R_HOME = $root
+          $env:R_LIBS = $LIB
+          $env:R_LIBS_USER = $LIB
+
+          & $rscript $wrapFile $root $LIB $installer
+
+      # ----------------- Audit bundled library (must contain required pkgs) -----------------
+      - name: Audit bundled R library
+        working-directory: electron
+        shell: pwsh
+        run: |
+          $R_HOME  = Resolve-Path "runtime\win\R"
+          $Rscript = Join-Path $R_HOME "bin\Rscript.exe"
+          $Rlib    = Join-Path $R_HOME "library"
+          & $Rscript -e @'
+            .libPaths(commandArgs(TRUE)[1])
+            req <- c("shiny","httpuv","RSQLite","DBI","dplyr","tidyr","DT","plotly",
+                    "visNetwork","igraph","dendextend","ggplot2","gridExtra",
+                    "shinyBS","reactable","shinybusy")
+            inst <- rownames(installed.packages())
+            cat("[AUDIT] In lib:", .libPaths()[1], "\n")
+            cat("[AUDIT] Missing:", paste(setdiff(req, inst), collapse=", "), "\n")
+          '@ -- "%Rlib%"
+
+
+      # ----------------- Smoke test the bundled runtime + library -----------------
+      - name: Smoke test portable R (load key packages)
+        working-directory: electron
+        shell: pwsh
+        run: |
+          $R_HOME   = Resolve-Path "runtime\win\R"
+          $Rscript  = Join-Path $R_HOME "bin\Rscript.exe"
+          if (-not (Test-Path $Rscript)) { throw "Missing $Rscript" }
+          $Rlib     = Join-Path $R_HOME "library"
+          $code = @'
+          .libPaths(commandArgs(TRUE)[1])
+          Sys.setenv(OMP_NUM_THREADS="1")
+          pkgs <- c("shiny","RSQLite","DBI","dplyr","tidyr","DT","plotly",
+                    "visNetwork","igraph","dendextend","ggplot2","gridExtra",
+                    "shinyBS","reactable","httpuv","shinybusy")
+          for (p in pkgs) {
+            cat("[SMOKE] Loading ", p, "...\n", sep="")
+            suppressPackageStartupMessages(library(p, character.only=TRUE))
+          }
+          cat("[SMOKE] OK\n")
+          '@
+          & $Rscript -e $code -- "%Rlib%"
+
+      # ----------------- Optional: show repo contents for debugging -----------------
       - name: Verify repo contents
         working-directory: electron
         shell: pwsh
@@ -71,6 +171,59 @@ jobs:
           Write-Host "List electron/data/:"
           if (Test-Path "data") { Get-ChildItem -Force -Recurse "data" | Select-Object -First 20 }
           else { Write-Host "electron/data not found" }
+
+      # ----------------- Stage Shiny app from repo root into resources/shinyapp -----------------
+      - name: Stage Shiny app (Windows)
+        working-directory: electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $dst = Join-Path (Get-Location) 'resources\shinyapp'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Force $dst | Out-Null
+
+          $root = Resolve-Path ".."
+
+          # Files to copy 1:1
+          $files = @(
+            "server.R","ui.R","global.R",
+            "README.md","purpose_of_files.txt","purpose_of_package.txt",
+            "google_analytics.js","google_analytics_GA4.html","human_mouse_source.html"
+          )
+          foreach ($f in $files) {
+            $src = Join-Path $root $f
+            if (Test-Path -LiteralPath $src) {
+              Copy-Item -LiteralPath $src -Destination (Join-Path $dst (Split-Path $src -Leaf)) -Force
+            } else {
+              Write-Host "Skip missing file: $f"
+            }
+          }
+
+          # Directories to mirror
+          $dirs = @("www")
+          foreach ($d in $dirs) {
+            $src = Join-Path $root $d
+            if (Test-Path -LiteralPath $src) {
+              $target = Join-Path $dst (Split-Path $src -Leaf)
+              if (-not (Test-Path $target)) { New-Item -ItemType Directory -Force $target | Out-Null }
+              robocopy $src $target /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+              $code = $LASTEXITCODE
+              Write-Host "ROBOCOPY($d) exit: $code"
+              if ($code -gt 3) { exit $code }
+              $global:LASTEXITCODE = 0
+            } else {
+              Write-Host "Skip missing dir: $d"
+            }
+          }
+
+          # Sanity checks for core files
+          @("server.R","ui.R","global.R") | ForEach-Object {
+            if (-not (Test-Path (Join-Path $dst $_))) {
+              throw "Missing $_ in resources\shinyapp"
+            }
+          }
+          Write-Host "Shiny app staged to: $dst"
 
       # ----------------- Stage app data into resources/data -----------------
       - name: Stage app data (Windows)
@@ -113,10 +266,61 @@ jobs:
           $global:LASTEXITCODE = 0
           exit 0
 
+      - name: Show entry & files
+        working-directory: electron
+        shell: pwsh
+        run: |
+          Write-Host "Expecting main entry per package.json:"
+          $mainRel = node -e "process.stdout.write(require('./package.json').main)"
+          Write-Host $mainRel
+
+          $mainAbs = Join-Path (Get-Location) $mainRel
+          if (-not (Test-Path $mainAbs)) {
+            throw "Entry file not found before packaging: $mainAbs (check package.json:main and build.files)"
+          }
+          Write-Host "OK: $mainAbs exists"
+
+          if (Test-Path "dist") {
+            Write-Host "Listing dist/ (pre-pack):"
+            Get-ChildItem -Recurse -Force dist | Select-Object -First 50 FullName
+          } else {
+            Write-Host "dist/ not present yet (this is normal before build)."
+          }
+
+
+
       # ----------------- Build Electron installer -----------------
-      - name: Build
+      - name: Build (electron-builder)
         working-directory: electron
         run: npm run dist
+      # ----------------- Post-build: clean & assert layout -----------------
+
+      # (Optional) Keep your original packaged runtime check or rely on the assertions above
+      - name: Check packaged runtime
+        if: always()
+        shell: pwsh
+        run: |
+          $res = Resolve-Path "electron/dist/win-unpacked/resources"
+          if (-not (Test-Path "$res/runtime/win/R/bin/Rscript.exe")) {
+            Write-Host "Contents of resources:"
+            Get-ChildItem -Recurse "$res" | Select-Object -First 200 FullName | Format-Table -AutoSize
+            throw "Packaged app missing resources/runtime/win/R/bin/Rscript.exe"
+          }
+          Write-Host "OK: Found packaged R at $res/runtime/win/R/bin/Rscript.exe"
+
+
+      # ----------------- Post-build: assert runtime packaged -----------------
+      - name: Check packaged runtime
+        if: always()
+        shell: pwsh
+        run: |
+          $res = Resolve-Path "electron/dist/win-unpacked/resources"
+          if (-not (Test-Path "$res/runtime/win/R/bin/Rscript.exe")) {
+            Write-Host "Contents of resources:"
+            Get-ChildItem -Recurse "$res" | Select-Object -First 200 FullName | Format-Table -AutoSize
+            throw "Packaged app missing resources/runtime/win/R/bin/Rscript.exe"
+          }
+          Write-Host "OK: Found packaged R at $res/runtime/win/R/bin/Rscript.exe"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
